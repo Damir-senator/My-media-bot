@@ -33,7 +33,7 @@ def download_media(url, output_dir="downloads"):
     logger.info(f"Original URL: {url}")
     logger.info(f"Cleaned URL: {cleaned_url}")
 
-    # Configure yt-dlp options with User-Agent spoofing
+    # Configure yt-dlp options with improved anti-blocking
     ydl_opts = {
         'outtmpl': f'{output_dir}/%(title)s.%(ext)s',
         'format': 'bestvideo+bestaudio/best',  # Best quality
@@ -41,11 +41,27 @@ def download_media(url, output_dir="downloads"):
         'noplaylist': True,                    # Download only single video
         'quiet': True,                         # Less verbose output
         'no_warnings': True,
-        # Spoof User-Agent to look like an iPhone to avoid blocking
-        'user_agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
+        
+        # --- IMPROVED ANTI-BLOCKING SETTINGS ---
+        # Use a generic Android User-Agent which is often less restricted than iPhone
+        'user_agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36',
+        
+        # Add Referer header to mimic coming from the site itself
         'http_headers': {
             'Accept-Language': 'en-US,en;q=0.9',
-        }
+            'Referer': 'https://www.instagram.com/',
+            'Sec-Fetch-Mode': 'navigate',
+        },
+        
+        # Force IPv4 (sometimes IPv6 addresses are blocked more often)
+        'source_address': '0.0.0.0',
+        
+        # Geo-bypass (sometimes helps)
+        'geo_bypass': True,
+        
+        # Add delay to avoid hitting rate limits too fast (optional, but safer)
+        'sleep_interval': 1,
+        'max_sleep_interval': 3,
     }
 
     try:
