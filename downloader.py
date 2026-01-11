@@ -1,59 +1,51 @@
 import os
 import uuid
 import subprocess
-import logging
 import json
-import glob
+import logging
+import urllib.request
+import socket
 
 DOWNLOAD_DIR = "/app/downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 logger = logging.getLogger(__name__)
 
-def download_media(url: str) -> dict:
-    media_id = str(uuid.uuid4())
-    output_template = os.path.join(DOWNLOAD_DIR, f"{media_id}_%(id)s.%(ext)s")
-    info_path = os.path.join(DOWNLOAD_DIR, f"{media_id}.info.json")
+# таймауты для сетевых операций
+socket.setdefaulttimeout(15)
 
-    # 1️⃣ Получаем метаданные
-    subprocess.run(
-        [
-            "yt-dlp",
-            url,
-            "--skip-download",
-            "--write-info-json",
-            "--no-playlist",
-            "-o", output_template,
-        ],
+def _run_json(url: str) -> dict:
+    """Получаем JSON от yt-dlp"""
+    result = subprocess.run(
+        ["yt-dlp", "-J", url],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
         check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
     )
+    return json.loads(result.stdout)
 
-    if not os.path.exists(info_path):
-        raise RuntimeError("Failed to fetch media info")
+def _download_image(url: str, path: str):
+    urllib.request.urlretrieve(url, path)
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        raise RuntimeError("Image download failed")
 
-    with open(info_path, "r", encoding="utf-8") as f:
-        info = json.load(f)
+def download_media(url: str) -> dict:
+    data = _run_json(url)
+    media_id = str(uuid.uuid4())
 
-    # 2️⃣ ЕСЛИ ЭТО ВИДЕО (реальная проверка)
-    formats = info.get("formats", [])
-    has_video = any(
-        f.get("vcodec") not in (None, "none")
-        for f in formats
-    )
-
-    if has_video:
+    # ---------- VIDEO ----------
+    if data.get("formats"):
         video_path = os.path.join(DOWNLOAD_DIR, f"{media_id}.mp4")
 
         subprocess.run(
             [
                 "yt-dlp",
                 url,
-                "-f", "mp4/best",
+                "-f", "bv*+ba/b",
                 "--merge-output-format", "mp4",
                 "--remux-video", "mp4",
-                "--no-playlist",
+                "--postprocessor-args", "ffmpeg:-movflags +faststart",
                 "-o", video_path,
             ],
             check=True,
@@ -61,7 +53,7 @@ def download_media(url: str) -> dict:
             stderr=subprocess.PIPE,
         )
 
-        if not os.path.exists(video_path):
+        if not os.path.exists(video_path) or os.path.getsize(video_path) == 0:
             raise RuntimeError("Video file not created")
 
         return {
@@ -69,31 +61,40 @@ def download_media(url: str) -> dict:
             "path": video_path,
         }
 
-    # 3️⃣ ЕСЛИ ЭТО PHOTO POST (CAROUSEL)
-    subprocess.run(
-        [
-            "yt-dlp",
-            url,
-            "--write-all-thumbnails",
-            "--skip-download",
-            "--no-playlist",
-            "-o", output_template,
-        ],
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    image_paths = []
 
-    images = sorted(
-        glob.glob(os.path.join(DOWNLOAD_DIR, f"{media_id}_*.jpg")) +
-        glob.glob(os.path.join(DOWNLOAD_DIR, f"{media_id}_*.png")) +
-        glob.glob(os.path.join(DOWNLOAD_DIR, f"{media_id}_*.webp"))
-    )
+    # ---------- PHOTO CAROUSEL ----------
+    entries = data.get("entries")
+    if isinstance(entries, list):
+        for i, entry in enumerate(entries, start=1):
+            thumbs = entry.get("thumbnails") or []
+            if not thumbs:
+                continue
 
-    if not images:
-        raise RuntimeError("No images found in photo post")
+            img_url = thumbs[-1].get("url")
+            if not img_url:
+                continue
+
+            img_path = os.path.join(DOWNLOAD_DIR, f"{media_id}_{i}.jpg")
+            _download_image(img_url, img_path)
+            image_paths.append(img_path)
+
+    # ---------- SINGLE IMAGE FALLBACK ----------
+    if not image_paths:
+        thumbs = data.get("thumbnails") or []
+        if thumbs:
+            img_url = thumbs[-1].get("url")
+            if img_url:
+                img_path = os.path.join(DOWNLOAD_DIR, f"{media_id}_1.jpg")
+                _download_image(img_url, img_path)
+                image_paths.append(img_path)
+
+    if not image_paths:
+        raise RuntimeError("No downloadable media found")
+
+    logger.info("Downloaded %d images", len(image_paths))
 
     return {
         "type": "images",
-        "paths": images,
+        "paths": image_paths,
     }
