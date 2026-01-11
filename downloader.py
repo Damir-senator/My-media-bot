@@ -1,5 +1,5 @@
-import uuid
 import os
+import uuid
 import subprocess
 import logging
 
@@ -9,35 +9,35 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 logger = logging.getLogger(__name__)
 
 def download_media(url: str) -> str:
-    filename = f"{uuid.uuid4()}.mp4"
-    output_path = os.path.join(DOWNLOAD_DIR, filename)
+    video_id = str(uuid.uuid4())
+    output_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.mp4")
 
     command = [
         "yt-dlp",
         url,
-
-        # 🎯 выбираем только mp4 + h264 если есть
-        "-f", "bv*[vcodec^=avc1]/bv*+ba/b",
-
-        # 🎥 контейнер mp4
+        "-f", "mp4/best",
         "--merge-output-format", "mp4",
-
-        # ⚡ moov atom в начале файла (Telegram)
-        "--postprocessor-args", "ffmpeg:-movflags +faststart",
-
-        # 🧠 безопасное имя
+        "--remux-video", "mp4",
+        "--no-playlist",
         "-o", output_path,
     ]
 
-    try:
-        subprocess.run(
-            command,
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,  # ❗ важно
-        )
-    except subprocess.CalledProcessError as e:
-        logger.error("yt-dlp failed: %s", e.stderr.decode(errors="ignore"))
-        raise
+    result = subprocess.run(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(f"yt-dlp error: {result.stderr.decode()}")
+
+    if not os.path.exists(output_path):
+        raise RuntimeError("MP4 file not created")
+
+    size = os.path.getsize(output_path)
+    if size < 100_000:  # <100 KB = мусор
+        raise RuntimeError("Downloaded file is too small")
+
+    logger.info("Downloaded video: %s (%d bytes)", output_path, size)
 
     return output_path
