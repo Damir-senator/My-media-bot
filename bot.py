@@ -36,7 +36,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
 
     if "tiktok.com" not in url:
-        await update.message.reply_text("Пока поддерживается только TikTok.")
+        await update.message.reply_text(
+            "Пока поддерживается только TikTok."
+        )
         return
 
     user = update.effective_user
@@ -49,27 +51,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id,
-        action=ChatAction.UPLOAD_VIDEO,
+        action=ChatAction.UPLOAD_DOCUMENT,
     )
 
     file_path = None
 
     try:
-        # 🔥 ВАЖНЫЙ ФИКС — БЕЗ await
+        # Скачиваем видео
         file_path = download_media(url)
 
         if not file_path or not os.path.exists(file_path):
-            raise RuntimeError("Download failed, file not found")
+            raise RuntimeError("Файл не был создан")
 
-        await update.message.reply_video(
-            video=InputFile(file_path),
-            supports_streaming=True
+        # ❗ КЛЮЧЕВОЙ ФИКС:
+        # Отправляем КАК ФАЙЛ, а не как video
+        await update.message.reply_document(
+            document=InputFile(file_path),
+            filename="video.mp4"
         )
 
-        logger.info("Video sent successfully")
+        logger.info("Video sent as document successfully")
 
     except Exception:
-        logger.exception("Video send error")
+        logger.exception("Send error")
         await update.message.reply_text(
             "Не удалось отправить видео. Попробуй другую ссылку."
         )
@@ -80,7 +84,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 os.remove(file_path)
                 logger.info("Temp file removed")
             except Exception:
-                logger.exception("File cleanup failed")
+                logger.exception("Failed to remove temp file")
 
 # -------------------- MAIN --------------------
 
