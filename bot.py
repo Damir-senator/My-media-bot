@@ -1,6 +1,5 @@
 import os
 import logging
-import asyncio
 from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -47,27 +46,47 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    user = update.effective_user
+    logger.info(
+        "Download request | user_id=%s username=%s url=%s",
+        user.id if user else None,
+        user.username if user else None,
+        url,
+    )
+
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id,
         action=ChatAction.UPLOAD_VIDEO,
     )
 
+    file_path = None
+    sent = False
+
     try:
         file_path = await download_media(url)
 
-        if not os.path.exists(file_path):
+        if not file_path or not os.path.exists(file_path):
             raise FileNotFoundError("Файл не был создан загрузчиком")
 
         with open(file_path, "rb") as video:
             await update.message.reply_video(video)
 
-        os.remove(file_path)
+        sent = True
+        logger.info("Video sent successfully | path=%s", file_path)
 
     except Exception:
-        logger.exception("Ошибка при скачивании видео")
+        logger.exception("Ошибка при скачивании или отправке видео")
         await update.message.reply_text(
-            "Произошла ошибка при скачивании видео."
+            "Произошла ошибка при скачивании или отправке видео."
         )
+
+    finally:
+        if sent and file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+                logger.info("Temp file removed | path=%s", file_path)
+            except Exception:
+                logger.exception("Не удалось удалить временный файл")
 
 # -------------------- MAIN --------------------
 
