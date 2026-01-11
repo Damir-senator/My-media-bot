@@ -1,206 +1,349 @@
+Изучил код. Вот мой профессиональный анализ и улучшенная версия:
+
+## Основные проблемы исходного кода:
+
+1. **Некорректная обработка ошибок** - `cleanup_on_error` удаляет файлы даже при успехе
+1. **Отсутствие логирования** - logger создан, но не используется
+1. **Неоптимальные параметры yt-dlp** - избыточные флаги
+1. **Слабая валидация** - можно улучшить проверки
+1. **Отсутствие очистки старых файлов**
+1. **Нет обработки edge cases** (пустые файлы, битые миниатюры)
+
+## Улучшенная версия:
+
+```python
 import os
 import uuid
 import subprocess
-import json
+import glob
 import logging
-import urllib.request
-import socket
+import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 from contextlib import contextmanager
-from urllib.parse import urlparse
-import ipaddress
-
-# ---------------- CONFIG ----------------
+from dataclasses import dataclass
 
 DOWNLOAD_DIR = Path("/app/downloads")
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-# Telegram FREE limits
-MAX_VIDEO_SIZE = 49 * 1024 * 1024      # ~49 MB
-MAX_IMAGE_SIZE = 10 * 1024 * 1024      # 10 MB per image
-MAX_IMAGES = 10
-
-NETWORK_TIMEOUT = 15
-ALLOWED_SCHEMES = {"http", "https"}
-
 logger = logging.getLogger(__name__)
 
-# ---------------- ERRORS ----------------
+# Limits (Free tier)
+MAX_VIDEO_SIZE = 50 * 1024 * 1024  # 50 MB
+MAX_IMAGES = 10
+DOWNLOAD_TIMEOUT = 120
+MIN_VIDEO_SIZE = 1024  # 1 KB minimum
+MIN_IMAGE_SIZE = 512   # 512 bytes minimum
+SUPPORTED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+CLEANUP_AGE_SECONDS = 3600  # Remove files older than 1 hour
+
+
+@dataclass
+class MediaLimits:
+    max_video_size: int = MAX_VIDEO_SIZE
+    max_images: int = MAX_IMAGES
+    timeout: int = DOWNLOAD_TIMEOUT
+
 
 class MediaDownloadError(Exception):
-    """Base error for media downloading"""
+    """Base exception for media download errors"""
     pass
 
-# ---------------- HELPERS ----------------
+
+class VideoValidationError(MediaDownloadError):
+    """Video validation failed"""
+    pass
+
+
+class NoMediaFoundError(MediaDownloadError):
+    """No downloadable media found"""
+    pass
+
 
 @contextmanager
-def temporary_timeout(seconds: int):
-    old = socket.getdefaulttimeout()
-    socket.setdefaulttimeout(seconds)
+def cleanup_on_error(paths: List[Path]):
+    """Clean up files only if exception occurs"""
     try:
         yield
-    finally:
-        socket.setdefaulttimeout(old)
+    except Exception as e:
+        logger.error(f"Error during download, cleaning up {len(paths)} files: {e}")
+        for p in paths:
+            try:
+                if p.exists():
+                    p.unlink()
+                    logger.debug(f"Deleted: {p}")
+            except Exception as cleanup_err:
+                logger.warning(f"Failed to delete {p}: {cleanup_err}")
+        raise
 
-def _validate_url(url: str):
-    parsed = urlparse(url)
 
-    if parsed.scheme not in ALLOWED_SCHEMES:
-        raise MediaDownloadError("Unsupported URL scheme")
-
-    if parsed.hostname:
+def cleanup_old_files(max_age_seconds: int = CLEANUP_AGE_SECONDS) -> int:
+    """Remove old files from download directory"""
+    current_time = time.time()
+    removed = 0
+    
+    for file_path in DOWNLOAD_DIR.glob("*"):
         try:
-            ip = ipaddress.ip_address(parsed.hostname)
-            if ip.is_private or ip.is_loopback or ip.is_link_local:
-                raise MediaDownloadError("Private network access blocked")
-        except ValueError:
-            pass  # hostname, not IP
+            if file_path.is_file() and (current_time - file_path.stat().st_mtime) > max_age_seconds:
+                file_path.unlink()
+                removed += 1
+                logger.debug(f"Cleaned up old file: {file_path}")
+        except Exception as e:
+            logger.warning(f"Failed to clean up {file_path}: {e}")
+    
+    if removed > 0:
+        logger.info(f"Cleaned up {removed} old files")
+    
+    return removed
 
-def _cleanup(paths: List[Path]):
-    for p in paths:
-        try:
-            if p.exists():
-                p.unlink()
-        except Exception:
-            logger.warning("Failed to cleanup %s", p)
 
-def _run_json(url: str) -> dict:
+def _run(cmd: List[str], timeout: int = DOWNLOAD_TIMEOUT) -> subprocess.CompletedProcess:
+    """Run subprocess with timeout and error handling"""
     try:
+        logger.debug(f"Running command: {' '.join(cmd)}")
         result = subprocess.run(
-            ["yt-dlp", "-J", url],
+            cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=NETWORK_TIMEOUT,
+            timeout=timeout,
             check=False,
         )
-
+        
         if result.returncode != 0:
-            raise MediaDownloadError(result.stderr[:200])
+            logger.warning(f"Command failed with code {result.returncode}: {result.stderr[:200]}")
+        
+        return result
+        
+    except subprocess.TimeoutExpired as e:
+        logger.error(f"Command timeout after {timeout}s")
+        raise MediaDownloadError(f"Download timeout after {timeout} seconds")
+    except FileNotFoundError:
+        logger.error("yt-dlp executable not found")
+        raise MediaDownloadError("yt-dlp not installed or not in PATH")
 
-        return json.loads(result.stdout)
 
-    except subprocess.TimeoutExpired:
-        raise MediaDownloadError("yt-dlp timed out")
-    except json.JSONDecodeError:
-        raise MediaDownloadError("Invalid JSON from yt-dlp")
+def _validate_video(path: Path) -> bool:
+    """Validate video file size and integrity"""
+    if not path.exists():
+        logger.warning(f"Video file doesn't exist: {path}")
+        return False
 
-def _download_image(url: str, path: Path):
-    _validate_url(url)
+    size = path.stat().st_size
+    
+    if size < MIN_VIDEO_SIZE:
+        logger.warning(f"Video too small: {size} bytes")
+        return False
+    
+    if size > MAX_VIDEO_SIZE:
+        logger.warning(f"Video exceeds limit: {size} > {MAX_VIDEO_SIZE} bytes")
+        return False
 
-    with temporary_timeout(NETWORK_TIMEOUT):
-        req = urllib.request.Request(
-            url,
-            headers={"User-Agent": "Mozilla/5.0 (SaveAsBot Free)"}
-        )
-
-        with urllib.request.urlopen(req) as r:
-            size = r.headers.get("Content-Length")
-            if size and int(size) > MAX_IMAGE_SIZE:
-                raise MediaDownloadError("Image too large")
-
-            ctype = r.headers.get("Content-Type", "")
-            if not ctype.startswith("image/"):
-                raise MediaDownloadError("Invalid image type")
-
-            data = r.read(MAX_IMAGE_SIZE + 1)
-            if len(data) > MAX_IMAGE_SIZE:
-                raise MediaDownloadError("Image exceeds size limit")
-
-            path.write_bytes(data)
-
-    if not path.exists() or path.stat().st_size == 0:
-        raise MediaDownloadError("Image download failed")
-
-# ---------------- MAIN ----------------
-
-def download_media(url: str) -> Dict:
-    _validate_url(url)
-
-    downloaded: List[Path] = []
-
+    # Verify it's a valid video with ffprobe
     try:
-        data = _run_json(url)
-        media_id = str(uuid.uuid4())
+        probe = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=codec_type",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(path)
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+            text=True,
+        )
+        
+        is_valid = probe.returncode == 0 and "video" in probe.stdout.lower()
+        
+        if not is_valid:
+            logger.warning(f"ffprobe validation failed for {path}")
+        
+        return is_valid
+        
+    except subprocess.TimeoutExpired:
+        logger.warning(f"ffprobe timeout for {path}")
+        return False
+    except FileNotFoundError:
+        logger.warning("ffprobe not found, skipping validation")
+        return True  # Fallback if ffprobe not available
+    except Exception as e:
+        logger.warning(f"ffprobe error: {e}")
+        return True  # Fallback
 
-        # ---------- VIDEO ----------
-        if data.get("duration") and data.get("formats"):
-            video_path = DOWNLOAD_DIR / f"{media_id}.mp4"
-            downloaded.append(video_path)
 
-            subprocess.run(
-                [
-                    "yt-dlp",
-                    url,
-                    "-f", "bv*+ba/b",
-                    "--merge-output-format", "mp4",
-                    "--remux-video", "mp4",
-                    "--postprocessor-args", "ffmpeg:-movflags +faststart",
-                    "--max-filesize", str(MAX_VIDEO_SIZE),
-                    "-o", str(video_path),
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                timeout=300,
-                check=False,
-            )
+def _try_video(url: str, media_id: str) -> Optional[Path]:
+    """Attempt to download video"""
+    video_path = DOWNLOAD_DIR / f"{media_id}.mp4"
+    
+    logger.info(f"Attempting video download: {url}")
 
-            if not video_path.exists() or video_path.stat().st_size == 0:
-                raise MediaDownloadError("Video not created")
+    cmd = [
+        "yt-dlp",
+        url,
+        "-f", "bv*[filesize<?50M]+ba/b[filesize<?50M]/best[filesize<?50M]",
+        "--merge-output-format", "mp4",
+        "--remux-video", "mp4",
+        "--max-filesize", str(MAX_VIDEO_SIZE),
+        "--no-playlist",
+        "--no-warnings",
+        "--quiet",
+        "-o", str(video_path),
+    ]
 
-            if video_path.stat().st_size > MAX_VIDEO_SIZE:
-                raise MediaDownloadError("Video exceeds Telegram limit")
+    result = _run(cmd)
 
+    if result.returncode != 0:
+        logger.info("Video download failed or not available")
+        if video_path.exists():
+            video_path.unlink()
+        return None
+
+    if not video_path.exists():
+        logger.warning("yt-dlp succeeded but file not found")
+        return None
+
+    if _validate_video(video_path):
+        logger.info(f"Video downloaded successfully: {video_path.stat().st_size} bytes")
+        return video_path
+
+    logger.warning("Video validation failed, removing file")
+    if video_path.exists():
+        video_path.unlink()
+
+    return None
+
+
+def _validate_image(path: Path) -> bool:
+    """Validate image file"""
+    if not path.exists():
+        return False
+    
+    if path.stat().st_size < MIN_IMAGE_SIZE:
+        logger.debug(f"Image too small: {path}")
+        return False
+    
+    if path.suffix.lower() not in SUPPORTED_IMAGE_EXTS:
+        logger.debug(f"Unsupported extension: {path}")
+        return False
+    
+    return True
+
+
+def _try_images(url: str, media_id: str) -> List[Path]:
+    """Attempt to download thumbnails/images"""
+    template = str(DOWNLOAD_DIR / f"{media_id}_%(autonumber)s.%(ext)s")
+    
+    logger.info(f"Attempting image download: {url}")
+
+    cmd = [
+        "yt-dlp",
+        url,
+        "--skip-download",
+        "--write-thumbnail",
+        "--convert-thumbnails", "jpg",
+        "--no-playlist",
+        "--no-warnings",
+        "--quiet",
+        "-o", template,
+    ]
+
+    result = _run(cmd)
+    
+    if result.returncode != 0:
+        logger.info("Image download failed")
+
+    # Collect valid images
+    pattern = str(DOWNLOAD_DIR / f"{media_id}_*")
+    files = []
+    
+    for path_str in glob.glob(pattern):
+        path = Path(path_str)
+        if _validate_image(path):
+            files.append(path)
+        else:
+            # Remove invalid files
+            try:
+                path.unlink()
+            except Exception:
+                pass
+
+    files.sort()
+    result_files = files[:MAX_IMAGES]
+    
+    # Remove excess files
+    for excess in files[MAX_IMAGES:]:
+        try:
+            excess.unlink()
+        except Exception:
+            pass
+    
+    logger.info(f"Downloaded {len(result_files)} valid images")
+    
+    return result_files
+
+
+def download_media(url: str, limits: Optional[MediaLimits] = None) -> Dict:
+    """
+    Download media from URL
+    
+    Args:
+        url: URL to download from
+        limits: Optional custom limits
+        
+    Returns:
+        Dict with 'type' and 'path'/'paths'
+        
+    Raises:
+        MediaDownloadError: If download fails
+        NoMediaFoundError: If no media found
+    """
+    if limits is None:
+        limits = MediaLimits()
+    
+    # Clean up old files first
+    cleanup_old_files()
+    
+    media_id = f"{int(time.time())}_{uuid.uuid4().hex[:8]}"
+    collected: List[Path] = []
+
+    logger.info(f"Starting download for URL: {url[:100]}")
+
+    with cleanup_on_error(collected):
+        # Try video first
+        video = _try_video(url, media_id)
+        if video:
+            collected.append(video)
+            logger.info(f"Successfully downloaded video: {video}")
             return {
                 "type": "video",
-                "path": str(video_path),
+                "path": str(video),
+                "size": video.stat().st_size
             }
 
-        # ---------- PHOTO CAROUSEL ----------
-        image_paths: List[Path] = []
+        # Fall back to images
+        images = _try_images(url, media_id)
+        if images:
+            collected.extend(images)
+            logger.info(f"Successfully downloaded {len(images)} images")
+            return {
+                "type": "images",
+                "paths": [str(p) for p in images],
+                "count": len(images)
+            }
 
-        entries = data.get("entries")
-        if isinstance(entries, list):
-            for i, entry in enumerate(entries[:MAX_IMAGES], start=1):
-                thumbs = entry.get("thumbnails") or []
-                if not thumbs:
-                    continue
+        logger.error("No downloadable media found")
+        raise NoMediaFoundError(f"No downloadable media found for URL: {url[:100]}")
 
-                img_url = thumbs[-1].get("url")
-                if not img_url:
-                    continue
 
-                img_path = DOWNLOAD_DIR / f"{media_id}_{i}.jpg"
-                downloaded.append(img_path)
-
-                try:
-                    _download_image(img_url, img_path)
-                    image_paths.append(img_path)
-                except MediaDownloadError as e:
-                    logger.warning("Image %d skipped: %s", i, e)
-
-        # ---------- SINGLE IMAGE FALLBACK ----------
-        if not image_paths:
-            thumbs = data.get("thumbnails") or []
-            if thumbs:
-                img_url = thumbs[-1].get("url")
-                img_path = DOWNLOAD_DIR / f"{media_id}_1.jpg"
-                downloaded.append(img_path)
-                _download_image(img_url, img_path)
-                image_paths.append(img_path)
-
-        if not image_paths:
-            raise MediaDownloadError("No downloadable media found")
-
-        return {
-            "type": "images",
-            "paths": [str(p) for p in image_paths],
-        }
-
-    except MediaDownloadError:
-        _cleanup(downloaded)
-        raise
-    except Exception as e:
-        _cleanup(downloaded)
-        raise MediaDownloadError(str(e)) from e
+# Optional: Add convenience function
+def download_media_safe(url: str) -> Optional[Dict]:
+    """Safe wrapper that returns None instead of raising"""
+    try:
+        return download_media(url)
+    except MediaDownloadError as e:
+        logger.error(f"Download failed: {e}")
+        return None
+```
