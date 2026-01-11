@@ -55,7 +55,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_path = None
 
     try:
-        file_path = await download_media(url)
+        # 🔥 ВАЖНЫЙ ФИКС — БЕЗ await
+        file_path = download_media(url)
 
         if not file_path or not os.path.exists(file_path):
             raise RuntimeError("Download failed, file not found")
