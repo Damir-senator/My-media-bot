@@ -2,6 +2,7 @@ import os
 import time
 import logging
 from collections import defaultdict, deque
+from typing import List
 
 from telegram import Update, InputMediaPhoto
 from telegram.constants import ChatAction
@@ -16,6 +17,7 @@ from telegram.ext import (
 from downloader import download_media
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+DOWNLOAD_DIR = "/app/downloads"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 # ---------- RATE LIMIT ----------
 RATE_LIMIT = 5
-RATE_WINDOW = 600
+RATE_WINDOW = 600  # 10 минут
 user_requests = defaultdict(deque)
 
 def is_rate_limited(user_id: int) -> bool:
@@ -69,17 +71,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id,
-        action=ChatAction.UPLOAD_DOCUMENT,
-    )
+    files_to_cleanup: List[str] = []
 
     try:
         result = download_media(url)
 
         # ---------- VIDEO ----------
         if result["type"] == "video":
-            with open(result["path"], "rb") as f:
+            await context.bot.send_chat_action(
+                chat_id=update.effective_chat.id,
+                action=ChatAction.UPLOAD_VIDEO,
+            )
+
+            video_path = result["path"]
+            files_to_cleanup.append(video_path)
+
+            with open(video_path, "rb") as f:
                 await update.message.reply_video(
                     video=f,
                     supports_streaming=True,
@@ -87,12 +94,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # ---------- IMAGES (CAROUSEL) ----------
         elif result["type"] == "images":
-            media = [
-                InputMediaPhoto(open(path, "rb"))
-                for path in result["paths"][:10]  # Telegram max 10
-            ]
+            await context.bot.send_chat_action(
+                chat_id=update.effective_chat.id,
+                action=ChatAction.UPLOAD_PHOTO,
+            )
+
+            media = []
+            opened_files = []
+
+            for path in result["paths"][:10]:
+                f = open(path, "rb")
+                opened_files.append(f)
+                files_to_cleanup.append(path)
+                media.append(InputMediaPhoto(f))
 
             await update.message.reply_media_group(media)
+
+            # закрываем файлы
+            for f in opened_files:
+                f.close()
+
+        else:
+            raise RuntimeError(f"Unknown media type: {result}")
 
         await update.message.reply_text(
             "Автор бота: Damir Kabdulla (@KING_TRAFF)"
@@ -105,11 +128,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     finally:
-        for f in os.listdir("/app/downloads"):
+        for path in files_to_cleanup:
             try:
-                os.remove(os.path.join("/app/downloads", f))
+                if os.path.exists(path):
+                    os.remove(path)
             except Exception:
-                pass
+                logger.warning("Failed to cleanup file: %s", path)
 
 # ---------- MAIN ----------
 
